@@ -1,0 +1,4 @@
+[submodule "exclient"]
+	path = exclient
+	url = git@github.com:hft-team/exclient.git
+	branch= defi

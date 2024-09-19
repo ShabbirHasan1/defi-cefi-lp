@@ -1,0 +1,14 @@
+/target
+/examples/target
+*.env
+/.vscode
+hft*
+config.json
+supervisord*
+pool-cache
+pumpfun-pool*
+jupiter-data
+cp-pool-cache
+config.json
+nohup*
+exclient
