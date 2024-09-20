@@ -32,6 +32,8 @@ pub struct LpConfig {
     pub min_apy: f64,
     //cefi最大杠杆率
     pub cefi_leverage: f64,
+    //允许对冲
+    pub enable_hedge: bool,
 }
 
 impl LpConfig {

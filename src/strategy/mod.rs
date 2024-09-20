@@ -40,7 +40,8 @@ pub struct LpStrategy {
     config: LpConfig,
     last_record_time: i64,
     last_hedge_time: HashMap<Currency, i64>,
-    last_trade_time: HashMap<Asset, i64>,   // 上次交易时间
+    last_hedge_signal_time: HashMap<Asset, i64>,
+    defi_eth_pos: HashMap<Asset, f64>,
     latest_depth_time: HashMap<Asset, i64>, // 当前币种的最新深度时间
     latest_current_depth_time: i64,
     contexts: HashMap<Asset, ContextData>,
@@ -109,11 +110,12 @@ impl LpStrategy {
             user_event_list: vec![],
             config,
             last_record_time: 0,
-            last_trade_time: HashMap::new(),
+            last_hedge_signal_time: HashMap::new(),
             last_hedge_time: HashMap::new(),
             latest_depth_time: HashMap::new(),
             contexts: HashMap::new(),
             latest_current_depth_time: 0,
+            defi_eth_pos: HashMap::new(),
             record_time_map: HashMap::new(),
         };
         //初始化历史数据
@@ -288,8 +290,6 @@ impl LpStrategy {
         }
 
         let (cefi_pos, _) = cefi_pos_account.unwrap();
-
-        let context_data = self.contexts.get(&defi_asset).unwrap().clone();
         //管理流动性，暂时先只考虑筛选出来的asset直接添加流动性，按底池比例，和最大仓位来添加
         {
             // let tvl: f64 = base_coin_price * defi_depth.asks[0].volume * 2.0;
@@ -319,6 +319,9 @@ impl LpStrategy {
         let amount_0 = reserve0 * lp_balance / lp_total_supply;
         let amount_1 = reserve1 * lp_balance / lp_total_supply;
 
+        //记录每个币的eth仓位
+        self.defi_eth_pos.insert(defi_asset, amount_1);
+
         field_map.insert("lp_balance".to_string(), json!(lp_balance));
         field_map.insert("lp_total_supply".to_string(), json!(lp_total_supply));
         field_map.insert("reserve0".to_string(), json!(reserve0));
@@ -327,75 +330,60 @@ impl LpStrategy {
         field_map.insert("amount_1".to_string(), json!(amount_1));
 
         //按照持仓的lp数量占比计算两种币的数量,进行对冲
-        let (hedge_amount0, hedge_amount1) = if context_data.token0_hedge == 0.0 {
-            (amount_0, amount_1)
-        } else {
-            //token1(eth)由于大量defi币对都在对冲,在cefi的仓位是统一的，所以只能依赖上下文信息，默认eth的对冲肯定成功
-            (
-                amount_0 - context_data.token0_hedge,
-                amount_1 - context_data.token1_hedge,
-            )
-        };
-
+        let hedge_amount0 = amount_0 - cefi_pos.volume.abs();
         field_map.insert("token0_hedge".to_string(), json!(cefi_pos.volume));
-        field_map.insert(
-            "token1_hedge".to_string(),
-            json!(-context_data.token1_hedge),
-        );
+        field_map.insert("token1_hedge".to_string(), json!(amount_1));
+        let defi_wealth_total = amount_1 * base_coin_price * 2.0;
         field_map.insert(
             "defi_current_pos_usd_wealth".to_string(),
-            json!(context_data.current_pos_usd_wealth),
+            json!(defi_wealth_total),
         );
 
-        let cefi_wealth_total = context_data.token1_hedge * base_coin_price
-            + context_data.token0_hedge * cefi_depth.mid_price();
+        let cefi_wealth_total = cefi_pos.volume * cefi_depth.mid_price() * 2.0;
         field_map.insert(
             "cefi_current_pos_usd_wealth".to_string(),
             json!(cefi_wealth_total),
         );
         field_map.insert(
             "total_wealth".to_string(),
-            json!(cefi_wealth_total + context_data.current_pos_usd_wealth),
+            json!(cefi_wealth_total.abs() + defi_wealth_total),
         );
 
-        let hedge_usd = hedge_amount1.abs() * base_coin_price;
         let now_ms = now_ms();
-        let signal_gap_ms = now_ms - context_data.hedge_signal_ts;
-
+        let signal_time = *self.last_hedge_signal_time.get(&defi_asset).unwrap_or(&0);
         let cefi_price = cefi_depth.mid_price();
         let defi_price = defi_depth.mid_price() * base_coin_price;
-        let hedge_limit = context_data.token1_hedge * self.config.min_hedge_rate * base_coin_price;
+        field_map.insert("cefi_price".to_string(), json!(cefi_price));
+        field_map.insert("defi_price".to_string(), json!(defi_price));
+
         //禁止对冲币种不对冲
         //eth 对冲信号出现15s后再对冲,相当于延迟一个区块对冲
-        if signal_gap_ms > self.config.hedge_time_delay
-            && (hedge_usd > hedge_limit)
+        if now_ms - signal_time > self.config.hedge_time_delay
+            && (hedge_amount0.abs() > cefi_pos.volume.abs() * self.config.min_hedge_rate)
             && !self.disabled_assets.contains(&defi_asset)
         {
             log::info!(
-                "on_tick hedge check  :  hedge_amount0  {} hedge_amount1  {}  lp_balance {}  lp_total_supply {}",
+                "on_tick hedge check  :  hedge_amount0  {}  lp_balance {}  lp_total_supply {} cefi_pos.volume {}  amount_0 {}",
                 hedge_amount0,
-                hedge_amount1,
                 lp_balance,
-                lp_total_supply
+                lp_total_supply,
+                cefi_pos.volume,
+                amount_0
             );
-
-            if context_data.hedge_signal_ts == 0 || signal_gap_ms > self.config.hedge_time_delay * 2
-            {
-                //仅更新对冲信号
-                self.update_context_hedge_data(defi_asset, 0.0, 0.0, now_ms);
+            if signal_time == 0 || now_ms - signal_time > 24000 {
+                self.last_hedge_signal_time.insert(defi_asset, now_ms);
                 return Ok(());
             }
 
             //对冲token0
-            let result = self
-                .hedging(
-                    &cefi_asset,
-                    -hedge_amount0,
-                    &cefi_pos,
-                    cefi_depth.mid_price(),
-                    &cefi_ak,
-                )
-                .await?;
+            self.hedging(
+                &cefi_asset,
+                -hedge_amount0,
+                &cefi_pos,
+                cefi_depth.mid_price(),
+                &cefi_ak,
+            )
+            .await?;
 
             log::info!(
                 "hedge_price   defi_price  {} cefi_price  {}  hedge_amount0{}",
@@ -403,17 +391,24 @@ impl LpStrategy {
                 cefi_price,
                 hedge_amount0
             );
-            if result {
-                self.update_context_hedge_data(defi_asset, hedge_amount0, 0.0, 0);
-            }
+            self.last_hedge_signal_time.insert(defi_asset, now_ms);
+        }
 
+        let defi_asset_count = self
+            .assets
+            .iter()
+            .filter(|asset| asset.exchange.is_defi())
+            .count();
+
+        //等所有币种的defi eth仓位都加载完成再检查对冲
+        if self.defi_eth_pos.len() == defi_asset_count {
             //对冲token1,主要是eth,usd不对冲
-            //eth有限制需要0.009eth最低才能对冲
             let currency = defi_asset.pair.1;
-            if currency != Currency::USDT
-                && currency != Currency::USDC
-                && hedge_amount1.abs() > 0.01
-            {
+            let last_hedge_time = self.last_hedge_time.entry(currency).or_insert(0);
+            if now_ms - *last_hedge_time < 15000 {
+                return Ok(());
+            }
+            if currency != Currency::USDT && currency != Currency::USDC {
                 let (origin_currency, _) = currency.into_origin_currency();
                 let assets = self.assets_by_currency.get(&origin_currency);
                 if assets.is_none() {
@@ -436,11 +431,16 @@ impl LpStrategy {
                         if cefi_depth.is_none() {
                             return Ok(());
                         }
+
+                        let token1_defi_pos: f64 =
+                            self.defi_eth_pos.iter().map(|(_, pos)| pos).sum();
+                        let hedge_amount1 = token1_defi_pos - cefi_pos.volume.abs();
                         let cefi_depth = cefi_depth.unwrap();
 
-                        //对冲token1
-                        let result = self
-                            .hedging(
+                        if hedge_amount1.abs() > cefi_pos.volume.abs() * self.config.min_hedge_rate
+                        {
+                            //对冲token1
+                            self.hedging(
                                 &cefi_asset1,
                                 -hedge_amount1,
                                 &cefi_pos,
@@ -448,16 +448,10 @@ impl LpStrategy {
                                 &cefi_ak,
                             )
                             .await?;
-                        if result {
-                            self.update_context_hedge_data(defi_asset, 0.0, hedge_amount1, 0);
                         }
                     }
                 }
             }
-
-            //缓存context信息
-            let contexts = self.contexts.clone();
-            save_context_to_file(contexts).await;
         }
 
         let record_time = self.record_time_map.get(&defi_asset).unwrap_or(&0);
@@ -502,7 +496,7 @@ impl LpStrategy {
         let now = now_ms();
         let last_hedge_time = self.last_hedge_time.entry(currency).or_insert(0);
         // TODO：使用1个区块时间12秒时，出现ETH反复对冲的情形。疑似多dex同币种，容易出现depth更新超过1个block的情形
-        if now - *last_hedge_time < 12000 {
+        if now - *last_hedge_time < 15000 {
             log::warn!("{} hedging time limit", currency);
             return Ok(false);
         }
@@ -520,16 +514,24 @@ DeltaPos {}
 CefiPrice {}
 
 CefiPos {}
+
+enable_hedge {}
 "#,
                     cefi_asset.to_string(),
                     size,
                     cefi_price,
                     cefi_pos_coin_value,
+                    self.config.enable_hedge,
                 ),
                 &self.excenter.config.instance_id,
             ),
             Some(self.config.robot_info_host.clone().unwrap().as_str()),
         );
+
+        //禁止下单提前返回不下单
+        if !self.config.enable_hedge {
+            return Ok(false);
+        }
 
         {
             // 如果是正常的币种或者乘数币种，直接对冲
