@@ -394,49 +394,52 @@ impl LpStrategy {
             self.last_hedge_signal_time.insert(defi_asset, now_ms);
         }
 
-        let defi_asset_count = self
-            .assets
-            .iter()
-            .filter(|asset| asset.exchange.is_defi())
-            .count();
+        //获取eth的仓位
+        let currency = defi_asset.pair.1;
+        if currency != Currency::USDT && currency != Currency::USDC {
+            let (origin_currency, _) = currency.into_origin_currency();
+            let assets = self.assets_by_currency.get(&origin_currency);
+            if assets.is_none() {
+                return Err(anyhow!("no match currency"));
+            } else {
+                let assets = assets.unwrap();
+                let cefi_assets: Vec<Asset> = assets
+                    .clone()
+                    .into_iter()
+                    .filter(|a| !a.exchange.is_defi() && a.asset_type == AssetType::SWAP)
+                    .collect();
+                if cefi_assets.len() > 0 {
+                    //取第一个来对冲
+                    let cefi_asset1 = cefi_assets[0];
+                    let cefi_pos_account =
+                        get_cefi_pos_and_account(&self.excenter, &cefi_asset1, &cefi_ak)?;
+                    let (cefi_pos, _) = cefi_pos_account.unwrap();
 
-        //等所有币种的defi eth仓位都加载完成再检查对冲
-        if self.defi_eth_pos.len() == defi_asset_count {
-            //对冲token1,主要是eth,usd不对冲
-            let currency = defi_asset.pair.1;
-            let last_hedge_time = self.last_hedge_time.entry(currency).or_insert(0);
-            if now_ms - *last_hedge_time < 15000 {
-                return Ok(());
-            }
-            if currency != Currency::USDT && currency != Currency::USDC {
-                let (origin_currency, _) = currency.into_origin_currency();
-                let assets = self.assets_by_currency.get(&origin_currency);
-                if assets.is_none() {
-                    return Err(anyhow!("no match currency"));
-                } else {
-                    let assets = assets.unwrap();
-                    let cefi_assets: Vec<Asset> = assets
-                        .clone()
-                        .into_iter()
-                        .filter(|a| !a.exchange.is_defi() && a.asset_type == AssetType::SWAP)
-                        .collect();
-                    if cefi_assets.len() > 0 {
-                        //取第一个来对冲
-                        let cefi_asset1 = cefi_assets[0];
-                        let cefi_pos_account =
-                            get_cefi_pos_and_account(&self.excenter, &cefi_asset1, &cefi_ak)?;
-                        let (cefi_pos, _) = cefi_pos_account.unwrap();
+                    let cefi_depth = get_cefi_depth(&cefi_asset1)?;
+                    if cefi_depth.is_none() {
+                        return Ok(());
+                    }
 
-                        let cefi_depth = get_cefi_depth(&cefi_asset1)?;
-                        if cefi_depth.is_none() {
+                    let defi_asset_count = self
+                        .assets
+                        .iter()
+                        .filter(|asset| asset.exchange.is_defi())
+                        .count();
+                    let token1_defi_pos: f64 = self.defi_eth_pos.iter().map(|(_, pos)| pos).sum();
+
+                    field_map.insert("defi_eth_pos".to_string(), json!(token1_defi_pos));
+                    field_map.insert("cefi_eth_pos".to_string(), json!(cefi_pos.volume));
+
+                    //等所有币种的defi eth仓位都加载完成再检查对冲
+                    if self.defi_eth_pos.len() == defi_asset_count {
+                        //对冲token1,主要是eth,usd不对冲
+                        let last_hedge_time = self.last_hedge_time.entry(currency).or_insert(0);
+                        if now_ms - *last_hedge_time < 15000 {
                             return Ok(());
                         }
 
-                        let token1_defi_pos: f64 =
-                            self.defi_eth_pos.iter().map(|(_, pos)| pos).sum();
                         let hedge_amount1 = token1_defi_pos - cefi_pos.volume.abs();
                         let cefi_depth = cefi_depth.unwrap();
-
                         if hedge_amount1.abs() > cefi_pos.volume.abs() * self.config.min_hedge_rate
                         {
                             //对冲token1
